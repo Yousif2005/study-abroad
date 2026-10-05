@@ -1,0 +1,529 @@
+'use client';
+
+import * as React from 'react';
+import { Suspense } from 'react';
+import { useSearchParams } from 'next/navigation';
+import useSWR from 'swr';
+import { KeyRound, Save, Trash2, CheckCircle2, XCircle, Lock, Server, RefreshCw, Palette, Sun, Moon, Monitor, Download } from 'lucide-react';
+import { useTheme } from 'next-themes';
+import { api, fetcher, ApiError, CLOUD_MODE } from '@/lib/api';
+import { ApiKeyCard } from '@/components/api-key-card';
+import { exportWorkspace, clearWorkspace, workspaceSize } from '@/lib/cloud/store';
+import { downloadFile } from '@/lib/utils';
+import type { Settings, Meta, HealthReport } from '@/lib/types';
+import { cn, formatDuration } from '@/lib/utils';
+import { Button } from '@/components/ui/button';
+import { Field, Input, Select, ComboInput } from '@/components/ui/field';
+import { Panel, PanelHeader, Tabs, TabsList, TabsTrigger, TabsContent, Badge, Notice, SwitchRow } from '@/components/ui/primitives';
+import { useToast } from '@/components/ui/toast';
+import { PageBody, PageHeader, LoadingBlock, ErrorBlock } from '@/components/shared';
+
+export default function SettingsPage() {
+  return (
+    <Suspense fallback={<PageBody><Panel><LoadingBlock /></Panel></PageBody>}>
+      <SettingsContent />
+    </Suspense>
+  );
+}
+
+/**
+ * Settings.
+ *
+ * The API key panel is the important one. The key is never sent back to the
+ * browser after it is stored — only whether one exists, where it came from, and
+ * a masked hint — so a shared screen or a screenshot cannot leak it.
+ */
+function SettingsContent() {
+  const searchParams = useSearchParams();
+  const toast = useToast();
+
+  const { data, error, isLoading, mutate } = useSWR<Settings>('/api/settings', fetcher);
+  const { data: meta } = useSWR<Meta>('/api/meta', fetcher);
+
+  const [tab, setTab] = React.useState(searchParams.get('tab') ?? 'keys');
+  const [draft, setDraft] = React.useState<Settings | null>(null);
+  const [saving, setSaving] = React.useState(false);
+
+  React.useEffect(() => {
+    if (data && !draft) setDraft(data);
+  }, [data, draft]);
+
+  const dirty = React.useMemo(() => {
+    if (!draft || !data) return false;
+    return JSON.stringify({ ...draft, apiKey: null, updatedAt: '' }) !== JSON.stringify({ ...data, apiKey: null, updatedAt: '' });
+  }, [draft, data]);
+
+  const save = async () => {
+    if (!draft) return;
+    setSaving(true);
+    try {
+      const saved = await api.patch<Settings>('/api/settings', {
+        defaultLanguage: draft.defaultLanguage,
+        defaultTone: draft.defaultTone,
+        defaultWordCount: draft.defaultWordCount,
+        defaultConcurrency: draft.defaultConcurrency,
+        demoMode: draft.demoMode,
+      });
+      setDraft(saved);
+      await mutate(saved, false);
+      toast.success('Settings saved');
+    } catch (err) {
+      toast.error('Could not save', err instanceof ApiError ? err.message : 'Unexpected error');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (error) {
+    return (
+      <PageBody>
+        <ErrorBlock error={error} onRetry={() => mutate()} />
+      </PageBody>
+    );
+  }
+
+  if (isLoading || !draft) {
+    return (
+      <PageBody>
+        <Panel>
+          <LoadingBlock label="Loading settings" />
+        </Panel>
+      </PageBody>
+    );
+  }
+
+  return (
+    <>
+      <PageHeader
+        title="Settings"
+        description="Your API key, the models each stage uses, and the defaults every new run starts from."
+        action={
+          <Button variant="primary" onClick={save} loading={saving} disabled={!dirty}>
+            <Save />
+            {dirty ? 'Save changes' : 'Saved'}
+          </Button>
+        }
+      />
+
+      <PageBody>
+        <Panel className="overflow-hidden">
+          <Tabs value={tab} onValueChange={setTab}>
+            <TabsList className="px-2">
+              <TabsTrigger value="keys">API key</TabsTrigger>
+              <TabsTrigger value="defaults">Run defaults</TabsTrigger>
+              <TabsTrigger value="appearance">Appearance</TabsTrigger>
+              <TabsTrigger value="system">System</TabsTrigger>
+            </TabsList>
+
+            <div className="p-5">
+              <TabsContent value="keys">
+                {CLOUD_MODE ? (
+                  <div className="max-w-2xl">
+                    <ApiKeyCard />
+                  </div>
+                ) : (
+                  /* Read from the SWR copy, not the local draft: the key state
+                     is server-owned and `draft` is seeded once, so a saved or
+                     cleared key would otherwise keep showing the old value. */
+                  <ApiKeyPanel settings={data ?? draft} onChanged={() => mutate()} />
+                )}
+              </TabsContent>
+
+              <TabsContent value="defaults" className="max-w-2xl space-y-5">
+                <p className="text-[0.8125rem] leading-relaxed text-[var(--color-text-muted)]">
+                  What the run wizard starts from. Every one can still be changed per run.
+                </p>
+
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <Field label="Language">
+                    {({ id }) => (
+                      <Select id={id} value={draft.defaultLanguage} onChange={(e) => setDraft({ ...draft, defaultLanguage: e.target.value })}>
+                        {(meta?.languages ?? []).map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </Select>
+                    )}
+                  </Field>
+
+                  <Field label="Tone" hint={meta?.tones.find((t) => t.value === draft.defaultTone)?.hint}>
+                    {({ id }) => (
+                      <Select id={id} value={draft.defaultTone} onChange={(e) => setDraft({ ...draft, defaultTone: e.target.value })}>
+                        {(meta?.tones ?? []).map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </Select>
+                    )}
+                  </Field>
+                </div>
+
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <Field label="Message length" hint="Words.">
+                    {({ id }) => (
+                      <Input
+                        id={id}
+                        type="number"
+                        min={80}
+                        max={1200}
+                        step={10}
+                        value={draft.defaultWordCount}
+                        onChange={(e) => setDraft({ ...draft, defaultWordCount: Number(e.target.value) })}
+                      />
+                    )}
+                  </Field>
+
+                  <Field label="Targets at once" hint="Lower this if you hit rate limits.">
+                    {({ id }) => (
+                      <Select
+                        id={id}
+                        value={String(draft.defaultConcurrency)}
+                        onChange={(e) => setDraft({ ...draft, defaultConcurrency: Number(e.target.value) })}
+                      >
+                        {[1, 2, 3, 4, 6, 8].map((n) => (
+                          <option key={n} value={n}>
+                            {n}
+                          </option>
+                        ))}
+                      </Select>
+                    )}
+                  </Field>
+                </div>
+
+                <div className="border-t border-[var(--color-border)]">
+                  <SwitchRow
+                    label="Always use demo mode"
+                    hint="Never call a model, even when a key is configured. Useful for showing the product to someone without spending anything."
+                    checked={draft.demoMode}
+                    onCheckedChange={(value) => setDraft({ ...draft, demoMode: value })}
+                  />
+                </div>
+              </TabsContent>
+
+              <TabsContent value="appearance" className="max-w-2xl">
+                <ThemePicker />
+              </TabsContent>
+
+              <TabsContent value="system" className="space-y-5">
+                {CLOUD_MODE ? <WorkspacePanel /> : <SystemPanel dataDir={draft.dataDir} />}
+              </TabsContent>
+            </div>
+          </Tabs>
+        </Panel>
+      </PageBody>
+    </>
+  );
+}
+
+function ApiKeyPanel({ settings, onChanged }: { settings: Settings; onChanged: () => void }) {
+  const toast = useToast();
+  const [value, setValue] = React.useState('');
+  const [saving, setSaving] = React.useState(false);
+  const [testing, setTesting] = React.useState(false);
+  const [testResult, setTestResult] = React.useState<{ ok: boolean; message: string } | null>(null);
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      await api.put('/api/settings/api-key', { apiKey: value.trim() });
+      setValue('');
+      setTestResult(null);
+      onChanged();
+      toast.success('API key saved', 'Test it below to confirm it works.');
+    } catch (err) {
+      toast.error('Could not save the key', err instanceof ApiError ? err.message : 'Unexpected error');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const clear = async () => {
+    try {
+      await api.delete('/api/settings/api-key');
+      setTestResult(null);
+      onChanged();
+      toast.success('API key cleared', 'Flow is back in demo mode.');
+    } catch (err) {
+      toast.error('Could not clear the key', err instanceof ApiError ? err.message : 'Unexpected error');
+    }
+  };
+
+  const test = async () => {
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const result = await api.post<{ ok: boolean; message: string }>('/api/settings/api-key/test');
+      setTestResult(result);
+    } catch (err) {
+      setTestResult({ ok: false, message: err instanceof ApiError ? err.message : 'Unexpected error' });
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  return (
+    <div className="max-w-2xl space-y-5">
+      {settings.apiKey.present ? (
+        <Notice tone="positive" icon={<CheckCircle2 />} title="A key is configured">
+          <span className="font-[family-name:var(--font-mono)]">{settings.apiKey.hint}</span>
+          {settings.apiKey.source === 'environment' && ' — set by the environment, so it cannot be changed here.'}
+        </Notice>
+      ) : (
+        <Notice tone="warning" icon={<KeyRound />} title="No key yet, so Flow is in demo mode">
+          Every stage returns representative output instead of calling a model. The whole product works; nothing is real.
+        </Notice>
+      )}
+
+      {settings.apiKey.editable ? (
+        <>
+          <Field
+            label="OpenAI or AgentRouter API key"
+            hint="For AgentRouter local mode, set AGENTROUTER_API_KEY in .env. Keys entered here use direct OpenAI."
+          >
+            {({ id }) => (
+              <Input
+                id={id}
+                type="password"
+                value={value}
+                onChange={(e) => setValue(e.target.value)}
+                placeholder={settings.apiKey.present ? 'Enter a new key to replace the current one' : 'sk-...'}
+                autoComplete="off"
+                spellCheck={false}
+              />
+            )}
+          </Field>
+
+          <div className="flex flex-wrap gap-2">
+            <Button variant="primary" onClick={save} loading={saving} disabled={value.trim().length < 20}>
+              <Save />
+              {settings.apiKey.present ? 'Replace key' : 'Save key'}
+            </Button>
+            <Button variant="secondary" onClick={test} loading={testing} disabled={!settings.apiKey.present}>
+              Test the key
+            </Button>
+            {settings.apiKey.present && (
+              <Button variant="dangerGhost" onClick={clear}>
+                <Trash2 />
+                Clear
+              </Button>
+            )}
+          </div>
+        </>
+      ) : (
+        <div className="space-y-4">
+          <Notice tone="neutral" icon={<Lock />}>
+            The key comes from <code className="font-[family-name:var(--font-mono)]">OPENAI_API_KEY</code> or{' '}
+            <code className="font-[family-name:var(--font-mono)]">AGENTROUTER_API_KEY</code> in your environment. Edit your{' '}
+            <code className="font-[family-name:var(--font-mono)]">.env</code> file to change it.
+          </Notice>
+          <Button variant="secondary" onClick={test} loading={testing}>
+            Test the key
+          </Button>
+        </div>
+      )}
+
+      {testResult && (
+        <Notice tone={testResult.ok ? 'positive' : 'negative'} icon={testResult.ok ? <CheckCircle2 /> : <XCircle />}>
+          {testResult.message}
+        </Notice>
+      )}
+
+      <div className="rounded-[var(--radius-control)] border border-[var(--color-border)] bg-[var(--color-surface-sunken)] p-4">
+        <h3 className="text-[0.8125rem] font-medium text-[var(--color-text)]">How the key is handled</h3>
+        <ul className="mt-2 space-y-1.5 text-[0.8125rem] leading-relaxed text-[var(--color-text-muted)]">
+          <li>Written to a gitignored file on this machine, never to the browser or a third-party server.</li>
+          <li>The stage services read it from disk rather than receiving it in a request, so it stays out of logs.</li>
+          <li>Only a masked hint is ever returned by the API.</li>
+        </ul>
+      </div>
+    </div>
+  );
+}
+
+function ThemePicker() {
+  const { theme, setTheme } = useTheme();
+  const [mounted, setMounted] = React.useState(false);
+  React.useEffect(() => setMounted(true), []);
+
+  const options = [
+    { value: 'light', label: 'Light', icon: Sun },
+    { value: 'dark', label: 'Dark', icon: Moon },
+    { value: 'system', label: 'Match system', icon: Monitor },
+  ];
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center gap-2">
+        <Palette className="size-4 text-[var(--color-text-faint)]" />
+        <h3 className="text-[0.9375rem] font-semibold text-[var(--color-text)]">Theme</h3>
+      </div>
+
+      <div className="grid gap-3 sm:grid-cols-3">
+        {options.map((option) => {
+          const Icon = option.icon;
+          const active = mounted && theme === option.value;
+
+          return (
+            <button
+              key={option.value}
+              type="button"
+              onClick={() => setTheme(option.value)}
+              className={cn(
+                'flex items-center gap-2.5 rounded-[var(--radius-control)] border px-4 py-3 text-left transition-colors',
+                active
+                  ? 'border-[var(--color-accent)] bg-[var(--color-accent-soft)] text-[var(--color-accent)]'
+                  : 'border-[var(--color-border)] text-[var(--color-text-muted)] hover:bg-[var(--color-surface-sunken)]',
+              )}
+            >
+              <Icon className="size-4" />
+              <span className="text-[0.8125rem] font-medium">{option.label}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      <p className="text-[0.8125rem] text-[var(--color-text-muted)]">
+        Stored in this browser only.
+      </p>
+    </div>
+  );
+}
+
+function SystemPanel({ dataDir }: { dataDir: string }) {
+  const { data, mutate, isValidating } = useSWR<HealthReport>('/api/health', fetcher, { refreshInterval: 15_000 });
+
+  return (
+    <div className="space-y-5">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <Server className="size-4 text-[var(--color-text-faint)]" />
+          <h3 className="text-[0.9375rem] font-semibold text-[var(--color-text)]">Services</h3>
+        </div>
+        <Button variant="ghost" size="sm" onClick={() => mutate()} loading={isValidating}>
+          <RefreshCw />
+          Check now
+        </Button>
+      </div>
+
+      <p className="text-[0.8125rem] leading-relaxed text-[var(--color-text-muted)]">
+        Flow runs as eight independent services behind one gateway. If a stage is down, only the steps that use it fail;
+        everything else keeps working.
+      </p>
+
+      <Panel className="overflow-hidden">
+        <div className="flex items-center justify-between border-b border-[var(--color-border)] px-4 py-3">
+          <div>
+            <p className="text-[0.8125rem] font-medium text-[var(--color-text)]">Gateway</p>
+            <p className="font-[family-name:var(--font-mono)] text-[0.6875rem] text-[var(--color-text-faint)]">
+              http://localhost:4000
+            </p>
+          </div>
+          <Badge tone={data ? 'positive' : 'negative'}>{data ? 'ok' : 'unreachable'}</Badge>
+        </div>
+
+        {(data?.services ?? []).map((service) => (
+          <div key={service.service} className="flex items-center justify-between border-b border-[var(--color-border)] px-4 py-3 last:border-b-0">
+            <div className="min-w-0">
+              <p className="text-[0.8125rem] font-medium text-[var(--color-text)]">{service.label}</p>
+              <p className="truncate font-[family-name:var(--font-mono)] text-[0.6875rem] text-[var(--color-text-faint)]">
+                {service.url}
+              </p>
+              {service.error && <p className="mt-0.5 text-[0.6875rem] text-[var(--color-rose)]">{service.error}</p>}
+            </div>
+            <div className="flex shrink-0 items-center gap-3">
+              <span className="numeric text-[0.6875rem] text-[var(--color-text-faint)]">
+                {formatDuration(service.latencyMs)}
+              </span>
+              <Badge tone={service.status === 'ok' ? 'positive' : service.status === 'degraded' ? 'warning' : 'negative'}>
+                {service.status}
+              </Badge>
+            </div>
+          </div>
+        ))}
+      </Panel>
+
+      <div className="rounded-[var(--radius-control)] border border-[var(--color-border)] bg-[var(--color-surface-sunken)] p-4">
+        <h4 className="text-[0.8125rem] font-medium text-[var(--color-text)]">Where your data lives</h4>
+        <p className="mt-1.5 font-[family-name:var(--font-mono)] text-xs text-[var(--color-text-muted)]">{dataDir}</p>
+        <p className="mt-2 text-[0.8125rem] leading-relaxed text-[var(--color-text-muted)]">
+          Applicants, targets, prompts, pipelines, and runs are plain JSON files on this machine. Nothing is uploaded
+          anywhere except the model calls you trigger yourself.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+
+/**
+ * Cloud mode has no services to report on. What matters instead is where the
+ * visitor's data actually is, and how to take it with them or wipe it — the
+ * two things anyone should be able to do with data held in their own browser.
+ */
+function WorkspacePanel() {
+  const toast = useToast();
+  const [bytes, setBytes] = React.useState(0);
+
+  React.useEffect(() => setBytes(workspaceSize()), []);
+
+  const download = () => {
+    downloadFile(`flow-workspace-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(exportWorkspace(), null, 2));
+    toast.success('Workspace exported', 'Your API key is deliberately not included.');
+  };
+
+  const reset = () => {
+    clearWorkspace();
+    toast.success('Workspace cleared', 'Reload the page to start fresh.');
+    setBytes(0);
+  };
+
+  return (
+    <div className="max-w-2xl space-y-5">
+      <div className="flex items-center gap-2">
+        <Server className="size-4 text-[var(--color-text-faint)]" />
+        <h3 className="text-[0.9375rem] font-semibold text-[var(--color-text)]">Your workspace</h3>
+      </div>
+
+      <p className="text-[0.8125rem] leading-relaxed text-[var(--color-text-muted)]">
+        This deployment stores nothing. Your applicants, targets, prompts, pipelines, and runs live in this browser, on
+        this device. Nobody else can read them, including whoever deployed the app — and they will not follow you to
+        another browser.
+      </p>
+
+      <Panel className="overflow-hidden">
+        <div className="flex items-center justify-between border-b border-[var(--color-border)] px-4 py-3">
+          <div>
+            <p className="text-[0.8125rem] font-medium text-[var(--color-text)]">Stored here</p>
+            <p className="text-[0.6875rem] text-[var(--color-text-faint)]">Browser local storage</p>
+          </div>
+          <span className="numeric text-[var(--color-text)]">{(bytes / 1024).toFixed(0)} KB</span>
+        </div>
+        <div className="flex items-center justify-between px-4 py-3">
+          <div>
+            <p className="text-[0.8125rem] font-medium text-[var(--color-text)]">Model calls</p>
+            <p className="text-[0.6875rem] text-[var(--color-text-faint)]">Sent from here to OpenAI, with your key</p>
+          </div>
+          <Badge tone="positive">direct</Badge>
+        </div>
+      </Panel>
+
+      <Notice tone="warning">
+        Browser storage is finite and can be cleared by the browser itself. Export a copy of anything you would mind
+        losing. Only the most recent 40 runs are kept.
+      </Notice>
+
+      <div className="flex flex-wrap gap-2">
+        <Button variant="secondary" onClick={download}>
+          <Download />
+          Export everything
+        </Button>
+        <Button variant="dangerGhost" onClick={reset}>
+          <Trash2 />
+          Clear this workspace
+        </Button>
+      </div>
+    </div>
+  );
+}
